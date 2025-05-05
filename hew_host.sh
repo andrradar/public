@@ -29,29 +29,45 @@ install_pkgs(){
     fi
   done
 }
+
 # ---------- 2. Mellanox ------------------------------------------------------
 install_mlx(){
   command -v ofed_info &>/dev/null && { log "ℹ️  OFED уже есть ($(ofed_info -s|tr -d '\n'))"; return; }
+
   local tgz
   tgz=$(find /tmp -maxdepth 1 -name 'MLNX_OFED_LINUX-*.tgz' | sort -V | tail -1 || true)
-  [[ $tgz ]] || { log "⏭️  Mellanox‑архив не найден — пропуск"; return; }
+
+  if [[ -z $tgz ]]; then
+      log "🔍 Mellanox‑архив не найден в /tmp."
+      echo -ne "Хотите загрузить драйвер и продолжить установку? [y/N] "
+      read -r ans
+      [[ $ans =~ ^[Yy]$ ]] || { log "⏭️  Mellanox пропущен по запросу пользователя"; return; }
+
+      echo "Скопируйте .tgz в /tmp и нажмите Enter."
+      read -r
+      tgz=$(find /tmp -maxdepth 1 -name 'MLNX_OFED_LINUX-*.tgz' | sort -V | tail -1 || true)
+      [[ $tgz ]] || { log "❌ Архив так и не найден, пропускаю."; return; }
+  fi
 
   log "📦 Распаковка $tgz"
   local wd; wd=$(mktemp -d)
   tar -xf "$tgz" -C "$wd"
-  local dir; dir=$(find "$wd" -maxdepth 1 -type d -name 'MLNX_OFED_LINUX-*' | head -1)
-  [[ -x $dir/mlnxofedinstall ]] || chmod +x "$dir/mlnxofedinstall"
 
-  log "🔄 Установка OFED (ждём)..."
+  local dir; dir=$(find "$wd" -maxdepth 1 -type d -name 'MLNX_OFED_LINUX-*' | head -1)
+  chmod +x "$dir/mlnxofedinstall"
+
+  log "🔄 Установка OFED (ждём)…"
   "$dir/mlnxofedinstall" --force --all --without-python | tee /tmp/mellanox_install.log
 
-  command -v ofed_info &>/dev/null \
-    && log "✅ OFED $(ofed_info -s) установлен" \
-    || log "⚠️  Проверь /tmp/mellanox_install.log — установка не подтверждена"
-
-  systemctl enable --now openibd 2>/dev/null || true
+  if command -v ofed_info &>/dev/null; then
+      log "✅ OFED $(ofed_info -s) установлен"
+      systemctl enable --now openibd 2>/dev/null || true
+  else
+      log "⚠️  Установка не подтверждена, см. /tmp/mellanox_install.log"
+  fi
   rm -rf "$wd"
 }
+
 # ---------- 3. SSH -----------------------------------------------------------
 ensure_ssh_key(){
   local ak=/root/.ssh/authorized_keys
@@ -92,6 +108,7 @@ EOF
   systemctl is-active --quiet "$svc" && log "✅ SSH перезапущен" \
                       || { mv "${SSH_CFG}$BKP" "$SSH_CFG"; systemctl restart "$svc"; log "❌ Откатил конфиг"; }
 }
+
 # ---------- 4. Финал ---------------------------------------------------------
 finish(){
   log "📦 apt upgrade/autoremove"
