@@ -1,145 +1,119 @@
 #!/bin/bash
 
-set -e
+# Удаляем machine-id и создаем новый при первом запуске
+sudo truncate -s 0 /etc/machine-id
+sudo rm -f /var/lib/dbus/machine-id
+sudo ln -s /etc/machine-id /var/lib/dbus/machine-id
 
-log() {
-    echo -e "\e[1;34m[$(date '+%Y-%m-%d %H:%M:%S')]\e[0m $1"
-}
+# Удаляем старые DHCP lease
+sudo rm -f /var/lib/dhcp/dhclient.*.leases
 
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo "\e[1;31mЭтот скрипт должен быть запущен с правами root.\e[0m"
-        exit 1
-    fi
-}
+# Удаляем сетевые правила udev
+sudo rm -f /etc/udev/rules.d/70-persistent-net.rules
 
-check_root
+# Удаляем флаг /etc/setup_completed, если он существует (только для эталонной ВМ)
+sudo rm -f /etc/setup_completed
 
-### === Настройка переменных окружения CUDA ===
-CUDA_VERSION=$(ls -d /usr/local/cuda-* 2>/dev/null | grep -o '[0-9.]*$' | head -1)
+# Очищаем историю терминала для пользователя root
+sudo truncate -s 0 /root/.bash_history
+history -c
 
-if [ -n "$CUDA_VERSION" ]; then
-    log "Настройка переменных окружения для CUDA $CUDA_VERSION"
-    cat > /etc/profile.d/cuda.sh << EOF
-export PATH=/usr/local/cuda-$CUDA_VERSION/bin\${PATH:+:\${PATH}}
-export LD_LIBRARY_PATH=/usr/local/cuda-$CUDA_VERSION/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}
-EOF
-    chmod +x /etc/profile.d/cuda.sh
-    source /etc/profile.d/cuda.sh
-    ln -sfn /usr/local/cuda-$CUDA_VERSION /usr/local/cuda
-    ldconfig
+# Удаляем логи, чтобы избежать переноса на клоны
+sudo find /var/log -type f -exec truncate -s 0 {} \;
+
+# Создаем скрипт для первого запуска на клонах
+cat <<'EOF' > /usr/local/bin/firstboot-setup.sh
+#!/bin/bash
+
+# Проверяем наличие флага, чтобы не выполнять скрипт повторно
+if [ -f /etc/setup_completed ]; then
+  echo "Скрипт уже выполнен ранее, пропускаем настройку."
+  exit 0
+fi
+
+# Удаляем и создаем символическую ссылку для machine-id
+truncate -s 0 /etc/machine-id
+rm /var/lib/dbus/machine-id
+ln -s /etc/machine-id /var/lib/dbus/machine-id
+
+# Проверяем и настраиваем dhcp-identifier в netplan
+if grep -q 'dhcp-identifier: mac' /etc/netplan/*.yaml; then
+  echo "dhcp-identifier уже настроен на MAC."
 else
-    log "\e[1;31mCUDA не обнаружена в /usr/local. Скрипт прерывается.\e[0m"
-    exit 1
+  sudo tee /etc/netplan/01-netcfg.yaml <<EOF2
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    default:
+      match:
+        name: e*
+      dhcp4: yes
+      dhcp-identifier: mac
+EOF2
 fi
 
-### === Установка cuDNN ===
-if ! ldconfig -p | grep -q libcudnn; then
-    log "Установка cuDNN из локального репозитория"
-    . /etc/os-release
-    UBUNTU_VER="${VERSION_ID//./}"
-    CUDNN_DEB="cudnn-local-repo-ubuntu${UBUNTU_VER}-9.8.0_1.0-1_amd64.deb"
+# Применяем настройки Netplan
+sudo netplan apply
 
-    if [ ! -f "/tmp/$CUDNN_DEB" ]; then
-        wget -O "/tmp/$CUDNN_DEB" "https://developer.download.nvidia.com/compute/cudnn/9.8.0/local_installers/$CUDNN_DEB"
-    fi
+# Удаляем старые DHCP lease
+sudo rm -f /var/lib/dhcp/dhclient.*.leases
 
-    dpkg -i "/tmp/$CUDNN_DEB"
-    cp /var/cudnn-local-repo-ubuntu*/cudnn-*-keyring.gpg /usr/share/keyrings/
-    apt-get update
-    apt-get -y install cudnn-cuda-12
+# Настройка systemd-networkd с ClientIdentifier=mac
+if [ -f /etc/systemd/network/default.network ]; then
+  sudo sed -i '/\[Network\]/a ClientIdentifier=mac' /etc/systemd/network/default.network
 else
-    log "cuDNN уже установлен — пропускаем"
+  sudo mkdir -p /etc/systemd/network
+  sudo tee /etc/systemd/network/default.network <<EOF3
+[Match]
+Name=e*
+
+[Network]
+DHCP=ipv4
+ClientIdentifier=mac
+EOF3
 fi
 
-### === Установка NVIDIA Container Toolkit ===
-if ! command -v docker &>/dev/null || ! docker info | grep -q 'nvidia'; then
-    log "Установка NVIDIA Container Toolkit и Docker"
-    apt-get install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+# Перезапускаем systemd-networkd, чтобы применить изменения
+sudo systemctl restart systemd-networkd
 
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-    add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+# Создаем флаг-файл, чтобы знать, что скрипт уже выполнен
+touch /etc/setup_completed
 
-    distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-    curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
-    curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+# Очищаем историю терминала
+history -c
+sudo truncate -s 0 ~/.bash_history
 
-    apt-get update
-    apt-get install -y docker-ce docker-ce-cli containerd.io nvidia-container-toolkit
+# Удаляем сам скрипт после завершения
+sudo rm -f /usr/local/bin/firstboot-setup.sh
 
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << 'EOF'
-{
-    "default-runtime": "nvidia",
-    "runtimes": {
-        "nvidia": {
-            "path": "nvidia-container-runtime",
-            "runtimeArgs": []
-        }
-    }
-}
+echo "Настройка завершена. Машина готова к работе."
 EOF
-    systemctl restart docker
-else
-    log "Docker и NVIDIA Container Toolkit уже установлены — пропускаем"
+
+# Делаем скрипт исполняемым
+chmod +x /usr/local/bin/firstboot-setup.sh
+
+# Добавляем скрипт в автозапуск
+if [ ! -f /etc/rc.local ]; then
+  sudo touch /etc/rc.local
+  sudo chmod +x /etc/rc.local
 fi
 
-### === Проверка CUDA через простой тест ===
-if [ ! -f /root/cuda_test/vector_add.cu ]; then
-    log "Создание CUDA-теста vector_add.cu"
-    mkdir -p /root/cuda_test
-    cat > /root/cuda_test/vector_add.cu << 'EOF'
-#include <stdio.h>
-#include <stdlib.h>
-#include <cuda_runtime.h>
-__global__ void vectorAdd(const float *A, const float *B, float *C, int numElements) {
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < numElements) {
-        C[i] = A[i] + B[i];
-    }
-}
-int main(void) {
-    int numElements = 50000;
-    size_t size = numElements * sizeof(float);
-    float *h_A = (float *)malloc(size);
-    float *h_B = (float *)malloc(size);
-    float *h_C = (float *)malloc(size);
-    for (int i = 0; i < numElements; ++i) {
-        h_A[i] = rand() / (float)RAND_MAX;
-        h_B[i] = rand() / (float)RAND_MAX;
-    }
-    float *d_A = NULL; cudaMalloc((void **)&d_A, size);
-    float *d_B = NULL; cudaMalloc((void **)&d_B, size);
-    float *d_C = NULL; cudaMalloc((void **)&d_C, size);
-    cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (numElements + threadsPerBlock - 1) / threadsPerBlock;
-    vectorAdd<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numElements);
-    cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
-    for (int i = 0; i < numElements; ++i) {
-        if (fabs(h_A[i] + h_B[i] - h_C[i]) > 1e-5) {
-            fprintf(stderr, "Mismatch at %d\n", i);
-            return 1;
-        }
-    }
-    printf("Test PASSED\n");
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
-    free(h_A); free(h_B); free(h_C);
-    return 0;
-}
-EOF
+if ! grep -q '/usr/local/bin/firstboot-setup.sh' /etc/rc.local; then
+  echo "/usr/local/bin/firstboot-setup.sh" | sudo tee -a /etc/rc.local
 fi
 
-log "Компиляция CUDA-теста"
-cd /root/cuda_test
-nvcc -o vector_add vector_add.cu
-./vector_add
+# Удаляем флаг-файл, если он существует
+sudo rm -f /etc/setup_completed
 
-log "🔄 Финальное обновление системы и очистка..."
-apt update && apt upgrade -y && apt autoremove -y
+# Эталонная ВМ готова для клонирования
+echo "Эталонная ВМ готова для клонирования."
 
-log "\e[1;32mВся установка завершена успешно. Система готова к использованию GPU.\e[0m"
+# Удаляем сам скрипт после завершения
+sudo rm -f /root/before_cloning.sh
 
-log "🧹 Удаление установочных скриптов..."
-rm -f /root/vgpu_install-1.sh /root/vgpu_install-2.sh
+# Ожидание 4 секунды перед выключением
+sleep 4
+
+# Грейсфулл шатдаун системы
+sudo shutdown -h now
